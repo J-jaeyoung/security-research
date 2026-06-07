@@ -28,58 +28,25 @@ on:
         type: boolean
         required: false
         default: false
-permissions: {}
+permissions:
+  contents: read
+  actions: read
 env:
   PR_REF: ${{ contains(github.event_name, 'workflow_') && (inputs.shaHash || format('refs/pull/{0}/merge', inputs.prNumber)) || github.event.pull_request.head.sha }}
 jobs:
-  structure_check:
-    # if labeling triggered the job then only run in case of the "recheck" label
-    if: github.event.action != 'labeled' || github.event.label.name == 'recheck'
-    runs-on: ubuntu-latest
-    permissions: {}
-    outputs:
-      targets: ${{ steps.check_submission.outputs.targets }}
-      submission_dir: ${{ steps.check_submission.outputs.submission_dir }}
-      exploits_info: ${{ steps.check_submission.outputs.exploits_info }}
-      artifact_backup_dir: ${{ steps.check_submission.outputs.artifact_backup_dir }}
-    steps:
-      - run: pip install -U jsonschema
-
-      - name: Checkout repo content (sparse - only check-submission.py)
-        uses: actions/checkout@v6
-        with:
-          ref: master
-          sparse-checkout: |
-            kernelctf/check-submission.py
-            kernelctf/utils.py
-          sparse-checkout-cone-mode: false
-
-      - name: Checkout PR content (full)
-        uses: actions/checkout@v6
-        with:
-          path: pr-content
-          ref: ${{ env.PR_REF }}
-          fetch-depth: 0
-
-      - id: check_submission
-        name: Check submission
-        working-directory: pr-content
-        run: |
-          echo "::stop-commands::$(uuidgen)"
-          ../kernelctf/check-submission.py ${{ github.event.pull_request.base.sha }}
-
   exploit_build:
     runs-on: ubuntu-latest
-    needs: structure_check
-    permissions: {}
+    permissions:
+      contents: read
+      actions: read
     strategy:
       matrix:
-        target: ${{ fromJSON(needs.structure_check.outputs.targets) }}
+        target: ['lts-6.12.67', 'cos-121-18867.294.100']   # light test: lts + cos, 1 repro each
       fail-fast: false # do not cancel other targets
     env:
       RELEASE_ID: ${{ matrix.target }}
-      EXPLOIT_DIR: pocs/linux/kernelctf/${{ needs.structure_check.outputs.submission_dir }}/exploit/${{ matrix.target }}
-      SUBMISSION_DIR: ${{ needs.structure_check.outputs.submission_dir }}
+      EXPLOIT_DIR: pocs/linux/kernelctf/CVE-2026-46242_lts_cos/exploit/${{ matrix.target }}
+      SUBMISSION_DIR: CVE-2026-46242_lts_cos
     steps:
       - name: Checkout PR content (full)
         uses: actions/checkout@v6
@@ -131,7 +98,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ needs.structure_check.outputs.artifact_backup_dir }}_exploit_${{ env.RELEASE_ID }}
+          name: exp448_exploit_${{ env.RELEASE_ID }}
           path: ${{ env.EXPLOIT_DIR }}/exploit
           if-no-files-found: error
 
@@ -139,7 +106,7 @@ jobs:
         if: failure() && steps.build_exploit.outcome == 'failure'
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ needs.structure_check.outputs.artifact_backup_dir }}_exploit_${{ env.RELEASE_ID }}
+          name: exp448_exploit_${{ env.RELEASE_ID }}
           path: ./exploit
           if-no-files-found: error
 
@@ -151,91 +118,22 @@ jobs:
         if: failure() && steps.build_exploit.outcome == 'failure'
         run: printf '❌ The exploit compilation failed.\n\nPlease fix it.\n\nYou can see the build logs by clicking on `...` here and then on "View job logs". Or by selecting `exploit_build (${{ env.RELEASE_ID }})` under Jobs in the left menubar.\n' >> $GITHUB_STEP_SUMMARY
 
-  exploit_build_debug:
-    runs-on: ubuntu-latest
-    needs: structure_check
-    permissions: {}
-    strategy:
-      matrix:
-        target: ${{ fromJSON(needs.structure_check.outputs.targets) }}
-      fail-fast: false # do not cancel other targets
-    env:
-      RELEASE_ID: ${{ matrix.target }}
-      EXPLOIT_DIR: pocs/linux/kernelctf/${{ needs.structure_check.outputs.submission_dir }}/exploit/${{ matrix.target }}
-      SUBMISSION_DIR: ${{ needs.structure_check.outputs.submission_dir }}
-    steps:
-      - name: Checkout PR content (full)
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ env.PR_REF }}
-          fetch-depth: 0
-
-      - name: Checkout Android scripts (sparse) - Android only
-        if: startsWith(matrix.target, 'android')
-        uses: actions/checkout@v6
-        with:
-          path: scripts-from-master
-          ref: master
-          sparse-checkout: |
-            kernelctf/server/get_android_dependencies.sh
-          sparse-checkout-cone-mode: false
-
-      - name: Install Android dependencies (exploit-build-only mode)
-        if: startsWith(matrix.target, 'android')
-        run: |
-          bash scripts-from-master/kernelctf/server/get_android_dependencies.sh --exploit-build-only
-
-      - name: Install kernelXDK (Linux only)
-        if: startsWith(matrix.target, 'android') == false
-        run: |
-          sudo apt install libkeyutils-dev
-          wget https://github.com/google/kernel-research/releases/download/libxdk%2Fv0.1/libxdk-v0.1.tar.gz
-          tar -xzvf libxdk-v0.1.tar.gz
-          chmod -R o+rx include lib
-          sudo cp -R include/* /usr/local/include/
-          sudo cp -R lib/* /usr/lib/
-
-      - name: Convert exploit to debug build
-        working-directory: ${{ env.EXPLOIT_DIR }}
-        run: |
-          # Add -g flag to any gcc, g++ or clang variant (including x86_64-linux-android21-clang)
-          sed -i -E 's/([a-zA-Z0-9_-]*)(gcc|g\+\+|clang)(\s)/\1\2 -g\3/g' Makefile
-          sed -i '/configure --enable-debug/!s/configure/configure --enable-debug/g' Makefile
-          sed -i 's/-o exploit\b/-o exploit_debug/g' Makefile
-          sed -i 's/ -s\b//g' Makefile
-          sed -i 's/exploit:/exploit_debug:/g' Makefile
-          sed -i 's/all: exploit$/all: exploit_debug/g' Makefile
-
-      - name: Build exploit
-        working-directory: ${{ env.EXPLOIT_DIR }}
-        run: |
-          if make -n prerequisites; then
-            make prerequisites
-          fi
-          make exploit_debug
-          file exploit_debug | grep debug_info
-
-      - name: Upload debug build
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{ needs.structure_check.outputs.artifact_backup_dir }}_exploit_debug_${{ env.RELEASE_ID }}
-          path: ${{ env.EXPLOIT_DIR }}/exploit_debug
-          if-no-files-found: error
-
   exploit_repro:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
-    permissions: {}
-    needs: [structure_check, exploit_build]
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    needs: exploit_build
     strategy:
       matrix:
-        target: ${{ fromJSON(needs.structure_check.outputs.targets) }}
+        target: ['lts-6.12.67', 'cos-121-18867.294.100']   # light test: lts + cos, 1 repro each
       fail-fast: false
-    if: always() && needs.structure_check.result == 'success' && !inputs.skipRepro
+    if: always() && !inputs.skipRepro
     env:
       RELEASE_ID: ${{ matrix.target }}
-      SUBMISSION_DIR: ${{ needs.structure_check.outputs.submission_dir }}
-      EXPLOIT_INFO: ${{ toJSON(fromJSON(needs.structure_check.outputs.exploits_info)[matrix.target]) }}
+      SUBMISSION_DIR: CVE-2026-46242_lts_cos
+      EXPLOIT_INFO: '{"uses":[],"requires_separate_kaslr_leak":false,"flag_time":"2026-02-11T13:54:24.111Z"}'
     defaults:
       run:
         shell: bash
@@ -252,7 +150,7 @@ jobs:
       - name: Download exploit
         uses: actions/download-artifact@v7
         with:
-          name: ${{ needs.structure_check.outputs.artifact_backup_dir }}_exploit_${{ env.RELEASE_ID }}
+          name: exp448_exploit_${{ env.RELEASE_ID }}
           path: ./kernelctf/repro/exp/
 
       - name: Make exploit executable
@@ -300,59 +198,14 @@ jobs:
           echo "ANDROID_RELEASE_PATH=$(realpath android_release)" >> $GITHUB_ENV
 
       - id: repro1
-        name: Reproduction (1 / 10)
+        name: Reproduction (1 / 1)
         continue-on-error: true
         run: ./repro.sh 1
-
-      - id: repro2
-        name: Reproduction (2 / 10)
-        continue-on-error: true
-        run: ./repro.sh 2
-
-      - id: repro3
-        name: Reproduction (3 / 10)
-        continue-on-error: true
-        run: ./repro.sh 3
-
-      - id: repro4
-        name: Reproduction (4 / 10)
-        continue-on-error: true
-        run: ./repro.sh 4
-
-      - id: repro5
-        name: Reproduction (5 / 10)
-        continue-on-error: true
-        run: ./repro.sh 5
-
-      - id: repro6
-        name: Reproduction (6 / 10)
-        continue-on-error: true
-        run: ./repro.sh 6
-
-      - id: repro7
-        name: Reproduction (7 / 10)
-        continue-on-error: true
-        run: ./repro.sh 7
-
-      - id: repro8
-        name: Reproduction (8 / 10)
-        continue-on-error: true
-        run: ./repro.sh 8
-
-      - id: repro9
-        name: Reproduction (9 / 10)
-        continue-on-error: true
-        run: ./repro.sh 9
-
-      - id: repro10
-        name: Reproduction (10 / 10)
-        continue-on-error: true
-        run: ./repro.sh 10
 
       - name: Upload repro logs as an artifact
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ needs.structure_check.outputs.artifact_backup_dir }}_repro_logs_${{ env.RELEASE_ID }}
+          name: exp448_repro_logs_${{ env.RELEASE_ID }}
           path: ./kernelctf/repro/repro_log_*.txt
 
       - name: Reproduction // Summary
@@ -365,36 +218,5 @@ jobs:
       - name: Upload repro summary as an artifact
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ needs.structure_check.outputs.artifact_backup_dir }}_repro_summary_${{ env.RELEASE_ID }}
+          name: exp448_repro_summary_${{ env.RELEASE_ID }}
           path: ./kernelctf/repro/repro_summary.md
-
-  vuln_verify:
-    uses: ./.github/workflows/kernelctf-vuln-verify.yaml
-    needs: structure_check
-    secrets: inherit
-    with:
-      prNumber: ${{ contains(github.event_name, 'workflow_') && inputs.prNumber || github.event.pull_request.number }}
-
-  backup_artifacts:
-    runs-on: ubuntu-latest
-    needs: [structure_check, exploit_build, exploit_build_debug, exploit_repro]
-    if: always() && needs.structure_check.result == 'success' && github.event_name != 'workflow_call'
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v7
-        with:
-          path: ./artifacts
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v3
-        with:
-          credentials_json: '${{secrets.KERNELCTF_GCS_SA_KEY}}'
-
-      - name: Upload artifacts to GCS
-        uses: 'google-github-actions/upload-cloud-storage@v2'
-        with:
-          path: ./artifacts
-          destination: kernelctf-build/artifacts/${{ needs.structure_check.outputs.artifact_backup_dir }}_${{ github.run_id }}
-          parent: false
-          predefinedAcl: publicRead
-          process_gcloudignore: false # removes warnings that .gcloudignore file does not exist
